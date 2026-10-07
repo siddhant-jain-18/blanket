@@ -161,6 +161,45 @@ def idle_inhibited() -> bool:
     return bool(out) and out[-1].lower() == "true"
 
 
+def poke_session_activity() -> None:
+    """Deactivate any desktop-side blank curtain (best effort, never raises).
+
+    While the panel is off we swallow every input event, so the session
+    can go idle underneath us and GNOME may draw its own blank on top.
+    Restoring panel power alone then shows a lit-but-black screen (the
+    "flicker with no desktop"). Explicitly deactivating the session
+    blank after powering the panel on hands the visible desktop back.
+    """
+    targets = (
+        # bus, object, interface, method, signature, args…
+        ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
+         "org.gnome.ScreenSaver", "SetActive", "b", "false"),
+        ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver",
+         "org.freedesktop.ScreenSaver", "SetActive", "b", "false"),
+    )
+    for bus, obj, iface, method, sig, *args in targets:
+        try:
+            _busctl("call", bus, obj, iface, method, sig, *args)
+        except Exception:
+            pass
+
+
+def await_power_state(mode: int, attempts: int = 5,
+                      delay: float = 0.1) -> bool:
+    """Poll until the compositor reports `mode`, or give up.
+
+    Mutter applies PowerSaveMode asynchronously: a single immediate
+    read-back can still show the previous value. Polling briefly tells a
+    slow-but-successful transition apart from a real failure — without
+    this, blanking falsely rolls back (flash off/on) on slow hardware.
+    """
+    for _ in range(attempts):
+        if display_power_state() == mode:
+            return True
+        time.sleep(delay)
+    return False
+
+
 # --- device classification -------------------------------------------------
 
 def _is_wake_device(dev: "evdev.InputDevice") -> bool:
@@ -401,8 +440,7 @@ class Watcher:
             return False
 
         # 2. Now it is safe to switch the panel off.
-        ok = set_display_power(POWER_OFF)
-        if not ok:
+        if not set_display_power(POWER_OFF):
             for dev in self.devices.values():
                 self._ungrab(dev)
             self.grabbed.clear()
@@ -412,22 +450,61 @@ class Watcher:
             )
             return False
 
+        # 3. The compositor applies the change asynchronously: wait briefly
+        #    for it to show up instead of treating a stale read-back as a
+        #    failure (that false rollback is a flash-off-and-back-on).
+        if not await_power_state(POWER_OFF):
+            for dev in self.devices.values():
+                self._ungrab(dev)
+            self.grabbed.clear()
+            set_display_power(POWER_ON)
+            print(
+                "blanket-watcher: panel never went off; left display on",
+                file=sys.stderr, flush=True,
+            )
+            return False
+
         self.armed = True
         self._state_cache = POWER_OFF
         self._state_at = time.monotonic()
 
-        # 3. Discard anything that arrived during the bus round-trip and
+        # 4. Discard anything that arrived during the bus round-trips and
         #    restart the idle clock from a clean slate.
         self._drain_all()
         self._last_activity = time.monotonic()
         print("blanket-watcher: armed", flush=True)
         return True
 
-    def unblank(self) -> None:
-        self.disarm()
+    def _wake(self) -> None:
+        """Restore the panel and hand inputs back (never leaves a grab).
+
+        Power is restored *before* the grabs are released: the moment
+        inputs flow again the compositor sees them and may drive the panel
+        itself, so setting power afterwards races it — that race is the
+        visible on/off flicker. The set is issued exactly once (no retry
+        storm: every extra modeset is another flash); the read-back below
+        only decides whether to log a warning.
+        """
+        now = time.monotonic()
         set_display_power(POWER_ON)
+        if not await_power_state(POWER_ON, attempts=3):
+            print(
+                "blanket-watcher: warning: panel did not report back on",
+                file=sys.stderr, flush=True,
+            )
         self._state_cache = POWER_ON
-        self._state_at = time.monotonic()
+        self._state_at = now
+        self._last_wake = time.time()
+        # Ungrab even if the panel misbehaved: a grabbed keyboard with a
+        # lit screen is worse than any power-state mismatch.
+        self.disarm()
+        # We swallowed everything while armed, so the session still looks
+        # idle to GNOME — tell it the user is here before it re-blanks us.
+        poke_session_activity()
+        print("blanket-watcher: woke display", flush=True)
+
+    def unblank(self) -> None:
+        self._wake()
 
     # ---- display state cache ----
 
@@ -475,10 +552,13 @@ class Watcher:
             if e.type == ecodes.EV_KEY:
                 if e.value != 0:  # press (1) or autorepeat (2)
                     return True
-            elif e.type in (ecodes.EV_REL, ecodes.EV_ABS, ecodes.EV_SW):
-                # Motion events carry signed deltas/positions; a zero-valued
-                # EV_ABS frame can be pure noise, but treating it as a wake
-                # is the safe direction (fail awake, never stranded).
+            elif e.type == ecodes.EV_REL:
+                if e.value != 0:  # real motion; zero-delta frames are noise
+                    return True
+            elif e.type in (ecodes.EV_ABS, ecodes.EV_SW):
+                # Position/switch changes mean real contact. A zero-valued
+                # EV_ABS frame can be noise, but waking is the safe
+                # direction here (fail awake, never stranded).
                 return True
             # EV_SYN / EV_MSC and anything else: not a wake gesture.
         return False
@@ -510,13 +590,9 @@ class Watcher:
         if not self._is_wake_event(events):
             return
 
-        # Swallow the wake key, then wake the display.
-        self.disarm()
-        set_display_power(POWER_ON)
-        self._state_cache = POWER_ON
-        self._state_at = now
-        self._last_wake = time.time()
-        print("blanket-watcher: woke display", flush=True)
+        # The wake keypress was already swallowed by the grab; restore the
+        # panel and hand the devices back.
+        self._wake()
 
     def _maybe_idle_blank(self) -> None:
         if self.armed or self.idle_seconds <= 0:
@@ -759,10 +835,12 @@ class Watcher:
 
     def shutdown(self) -> None:
         was_armed = self.armed
-        self.disarm()
         if was_armed:
             # Don't leave the user with a blank panel and no watcher.
+            # Power first, then release the grabs (same anti-flicker order
+            # as the wake path).
             set_display_power(POWER_ON)
+        self.disarm()
 
         for fd in list(self.clients):
             self._close_client(fd)

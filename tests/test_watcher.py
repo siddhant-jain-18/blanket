@@ -111,14 +111,27 @@ class CommandTests(unittest.TestCase):
         modes = [call.args[0] for call in self.power.call_args_list]
         self.assertEqual(modes, [mod.POWER_OFF])
 
-    def test_blank_does_not_falsely_roll_back_on_stale_readback(self):
-        # Mutter applies PowerSaveMode asynchronously: an immediate
-        # read-back may still show the old value. blank() must trust the
-        # set request (which succeeded), not a racy re-read.
-        self.state.return_value = mod.POWER_ON  # stale read-back
-        result = self.watcher._handle_command("blank")
+    def test_blank_waits_for_async_apply(self):
+        # Mutter applies PowerSaveMode asynchronously: the first read-back
+        # may still show the old value. blank() must wait briefly instead
+        # of treating one stale read as failure (flash off/back on).
+        self.state.side_effect = [mod.POWER_ON, mod.POWER_OFF]
+        with mock.patch.object(mod.time, "sleep"):
+            result = self.watcher._handle_command("blank")
         self.assertTrue(result["armed"])
         self.assertTrue(self.watcher.armed)
+
+    def test_blank_rolls_back_when_panel_never_goes_off(self):
+        # The set was accepted but the panel never reports off: roll back
+        # (and restore power) rather than stranding the user.
+        self.state.return_value = mod.POWER_ON
+        with mock.patch.object(mod.time, "sleep"):
+            result = self.watcher._handle_command("blank")
+        self.assertFalse(result["armed"])
+        self.assertFalse(self.watcher.armed)
+        modes = [call.args[0] for call in self.power.call_args_list]
+        self.assertEqual(modes[0], mod.POWER_OFF)
+        self.assertEqual(modes[-1], mod.POWER_ON)
 
     def test_blank_arms_when_display_is_off(self):
         result = self.watcher._handle_command("blank")
@@ -271,6 +284,14 @@ class WakeFilterTests(unittest.TestCase):
         power = mock.patch.object(mod, "set_display_power")
         self.power = power.start()
         self.addCleanup(power.stop)
+        state = mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        )
+        state.start()
+        self.addCleanup(state.stop)
+        poke = mock.patch.object(mod, "poke_session_activity")
+        self.poke = poke.start()
+        self.addCleanup(poke.stop)
 
     def _feed(self, *events):
         dev = mock.MagicMock()
@@ -374,6 +395,8 @@ class ImmediateWakeTests(unittest.TestCase):
         watcher = make_watcher()
         with mock.patch.object(
             mod, "set_display_power", return_value=True
+        ), mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_OFF
         ), redirect_stdout(io.StringIO()):
             self.assertTrue(watcher.blank())
         from evdev import ecodes
@@ -386,7 +409,11 @@ class ImmediateWakeTests(unittest.TestCase):
         watcher.devices["/dev/input/event0"] = dev
         with mock.patch.object(
             mod, "set_display_power"
-        ) as power, redirect_stdout(io.StringIO()):
+        ) as power, mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), mock.patch.object(
+            mod, "poke_session_activity"
+        ), redirect_stdout(io.StringIO()):
             watcher._handle_input("/dev/input/event0")
         self.assertFalse(watcher.armed)
         power.assert_called_once_with(mod.POWER_ON)
@@ -437,6 +464,116 @@ class GrabTrackingTests(unittest.TestCase):
         ), mock.patch.object(watcher, "_inhibited", return_value=False):
             st = watcher.status()
         self.assertEqual(st["grabbed"], 1)  # not len(devices) == 2
+
+
+class WakePathTests(unittest.TestCase):
+    """The wake path must not flicker: power first, then ungrab."""
+
+    def test_wake_sets_power_before_releasing_grabs(self):
+        watcher = make_watcher()
+        watcher.armed = True
+        order = []
+        dev = mock.MagicMock()
+        dev.path = "/dev/input/event0"
+        watcher.devices["/dev/input/event0"] = dev
+        watcher.grabbed.add("/dev/input/event0")
+        orig_ungrab = watcher._ungrab
+        watcher._ungrab = mock.MagicMock(
+            side_effect=lambda d: (order.append("ungrab"), orig_ungrab(d))
+        )
+        with mock.patch.object(
+            mod, "set_display_power",
+            side_effect=lambda m: order.append(f"power{m}") or True,
+        ), mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), mock.patch.object(
+            mod, "poke_session_activity"
+        ), redirect_stdout(io.StringIO()):
+            watcher._wake()
+        self.assertLess(order.index("power0"), order.index("ungrab"), order)
+        self.assertFalse(watcher.armed)
+
+    def test_wake_issues_single_power_set(self):
+        # Every extra modeset is another visible flash: exactly one set.
+        watcher = make_watcher()
+        watcher.armed = True
+        with mock.patch.object(
+            mod, "set_display_power", return_value=True
+        ) as power, mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), mock.patch.object(
+            mod, "poke_session_activity"
+        ), redirect_stdout(io.StringIO()):
+            watcher._wake()
+        power.assert_called_once_with(mod.POWER_ON)
+
+    def test_wake_pokes_session_activity(self):
+        watcher = make_watcher()
+        watcher.armed = True
+        with mock.patch.object(
+            mod, "set_display_power", return_value=True
+        ), mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), mock.patch.object(
+            mod, "poke_session_activity"
+        ) as poke, redirect_stdout(io.StringIO()):
+            watcher._wake()
+        poke.assert_called_once_with()
+
+    def test_wake_releases_grabs_even_if_panel_misbehaves(self):
+        # A grabbed keyboard with a lit screen strands the user; the
+        # panel being stuck must never block the ungrab.
+        watcher = make_watcher()
+        watcher.armed = True
+        dev = mock.MagicMock()
+        dev.path = "/dev/input/event0"
+        watcher.devices["/dev/input/event0"] = dev
+        watcher.grabbed.add("/dev/input/event0")
+        with mock.patch.object(
+            mod, "set_display_power", return_value=True
+        ), mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_OFF
+        ), mock.patch.object(
+            mod, "poke_session_activity"
+        ), mock.patch.object(
+            mod.time, "sleep"
+        ), redirect_stdout(io.StringIO()):
+            watcher._wake()
+        self.assertFalse(watcher.armed)
+        self.assertEqual(watcher.grabbed, set())
+        dev.ungrab.assert_called_once()
+
+    def test_rel_zero_delta_does_not_wake(self):
+        from evdev import ecodes
+        frame = [types.SimpleNamespace(type=ecodes.EV_REL, code=0, value=0)]
+        self.assertFalse(mod.Watcher._is_wake_event(frame))
+        frame = [types.SimpleNamespace(type=ecodes.EV_REL, code=0, value=3)]
+        self.assertTrue(mod.Watcher._is_wake_event(frame))
+
+
+class AwaitStateTests(unittest.TestCase):
+    def test_returns_true_immediately_when_already_there(self):
+        with mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_OFF
+        ), mock.patch.object(mod.time, "sleep") as sleep:
+            self.assertTrue(mod.await_power_state(mod.POWER_OFF))
+        sleep.assert_not_called()
+
+    def test_waits_through_transient_stale_reads(self):
+        with mock.patch.object(
+            mod, "display_power_state",
+            side_effect=[mod.POWER_ON, mod.POWER_ON, mod.POWER_OFF],
+        ), mock.patch.object(mod.time, "sleep"):
+            self.assertTrue(mod.await_power_state(mod.POWER_OFF))
+
+    def test_gives_up_after_attempts(self):
+        with mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), mock.patch.object(mod.time, "sleep") as sleep:
+            self.assertFalse(
+                mod.await_power_state(mod.POWER_OFF, attempts=3)
+            )
+        self.assertEqual(sleep.call_count, 3)
 
 
 class CrashRecoveryTests(unittest.TestCase):
