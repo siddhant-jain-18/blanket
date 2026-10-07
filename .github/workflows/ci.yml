@@ -10,23 +10,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
+      # NOTE: use the runner's system python3 here, NOT setup-python:
+      # python3-evdev comes from apt and is only importable by
+      # /usr/bin/python3. An isolated setup-python interpreter cannot see
+      # apt site-packages, which fails with "No module named 'evdev'".
       - name: Install test dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q python3-evdev
-          python3 -c 'import evdev; print("evdev ok")'
+          /usr/bin/python3 -c 'import evdev; print("evdev ok")'
+
+      - name: Show interpreter versions
+        run: |
+          /usr/bin/python3 --version
+          which python3 || true
 
       - name: Compile check (watcher + completions sanity)
         run: |
-          python3 -m py_compile blanket-watcher.py
+          /usr/bin/python3 -m py_compile blanket-watcher.py
           bash -n blanket.sh
           bash -n install.sh
           bash -n uninstall.sh
 
       - name: Run watcher unit tests
-        run: timeout 120 python3 -m unittest discover -s tests -v
+        run: timeout 120 /usr/bin/python3 -m unittest discover -s tests -v
