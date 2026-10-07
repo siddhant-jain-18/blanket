@@ -1,0 +1,35 @@
+#compdef blanket
+
+_blanket() {
+    local -a commands
+    commands=(
+        'off:Blank the screen'
+        'on:Unblank the screen'
+        'toggle:Toggle between on and off'
+        'status:Show the display power state'
+        'idle:Blank after N seconds of inactivity'
+        'list:List input devices seen by the watcher'
+        'doctor:Diagnose common setup problems'
+        'help:Show help'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'blanket command' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        status)
+            _arguments '--verbose[show watcher details]' '-v[show watcher details]'
+            ;;
+        off)
+            _arguments '--force[blank even if the watcher is not running]' \
+                       '-f[blank even if the watcher is not running]'
+            ;;
+        idle)
+            _values 'seconds, off, or status' off status 60 300 600 900
+            ;;
+    esac
+}
+
+_blanket "$@"

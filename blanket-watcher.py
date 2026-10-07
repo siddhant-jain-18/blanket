@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
 blanket-watcher — wake the display on any input while it has been blanked
-by the `blanket` CLI.
+by the `blanket` CLI, and optionally blank it automatically after a period
+of inactivity.
 
-Signals:
+Signals (kept for compatibility; the CLI now prefers the control socket):
 
     SIGUSR1   arm    — grab the input devices so the wake keypress is
                        swallowed instead of reaching the focused app.
     SIGUSR2   disarm — release the grabs.
 
-Any input event that arrives while the watcher is armed puts the display
-back on (PowerSaveMode 0) and disarms. The event that triggered the wake
-is not delivered to any application.
+Control socket:
+
+    $XDG_RUNTIME_DIR/blanket.sock
+
+The CLI talks to the watcher here. Each request is a single line and each
+response is a series of `key=value` lines whose first line is `ok=true` or
+`ok=false`. Commands: ping, status, list, blank, unblank, arm, disarm,
+idle [N|off|status], reload.
 
 Runs as a systemd user service. The user must be in the `input` group to
 read /dev/input/event*.
@@ -23,6 +29,7 @@ import atexit
 import os
 import select
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -45,6 +52,11 @@ BUS = "org.gnome.Mutter.DisplayConfig"
 OBJ = "/org/gnome/Mutter/DisplayConfig"
 IFACE = "org.gnome.Mutter.DisplayConfig"
 
+SESSION_BUS = "org.gnome.SessionManager"
+SESSION_OBJ = "/org/gnome/SessionManager"
+SESSION_IFACE = "org.gnome.SessionManager"
+INHIBIT_IDLE = 8               # gsm inhibitor flag: "session is idle"
+
 POWER_ON = 0
 POWER_OFF = 3
 
@@ -52,10 +64,47 @@ RUNTIME_DIR = Path(
     os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 )
 PIDFILE = RUNTIME_DIR / "blanket.pid"
+SOCKET_PATH = RUNTIME_DIR / "blanket.sock"
+
+CONFIG_HOME = Path(
+    os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+)
+CONFIG_PATH = CONFIG_HOME / "blanket" / "config"
 
 REFRESH_INTERVAL = 5.0       # seconds between /dev/input rescans
 POLL_TIMEOUT_MS = 100        # responsiveness of the signal-driven path
 STATE_CACHE_TTL = 0.4        # seconds a busctl reading stays valid
+INHIBIT_CACHE_TTL = 2.0      # seconds an inhibitor reading stays valid
+IDLE_TICK = 1.0              # seconds between idle-timer evaluations
+
+
+# --- configuration ---------------------------------------------------------
+
+def load_config() -> dict:
+    """Read the simple `key=value` config file, with sane defaults."""
+    cfg = {"idle": 0, "respect_inhibitors": True}
+    try:
+        text = CONFIG_PATH.read_text()
+    except OSError:
+        return cfg
+
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "idle":
+            try:
+                cfg["idle"] = max(0, int(value))
+            except ValueError:
+                pass
+        elif key == "respect_inhibitors":
+            cfg["respect_inhibitors"] = value.lower() in (
+                "1", "true", "yes", "on",
+            )
+    return cfg
 
 
 # --- D-Bus helpers ---------------------------------------------------------
@@ -82,14 +131,34 @@ def display_power_state() -> int | None:
         return None
 
 
-def set_display_on() -> None:
+def set_display_power(mode: int) -> bool:
     try:
-        _busctl(
+        cp = _busctl(
             "set-property", BUS, OBJ, IFACE,
-            "PowerSaveMode", "i", str(POWER_ON),
+            "PowerSaveMode", "i", str(mode),
         )
     except subprocess.TimeoutExpired:
-        pass
+        return False
+    return cp.returncode == 0
+
+
+def idle_inhibited() -> bool:
+    """True when an app (video player, call, …) is holding the session awake.
+
+    Fails open: if the session manager is unreachable we assume nothing is
+    inhibiting idle, otherwise the idle timer would silently never fire.
+    """
+    try:
+        cp = _busctl(
+            "call", SESSION_BUS, SESSION_OBJ, SESSION_IFACE,
+            "IsInhibited", "u", str(INHIBIT_IDLE),
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    if cp.returncode != 0:
+        return False
+    out = cp.stdout.strip().split()
+    return bool(out) and out[-1].lower() == "true"
 
 
 # --- device classification -------------------------------------------------
@@ -111,18 +180,48 @@ def _is_wake_device(dev: "evdev.InputDevice") -> bool:
 # --- watcher ---------------------------------------------------------------
 
 class Watcher:
-    def __init__(self) -> None:
+    def __init__(self, config: dict | None = None) -> None:
+        config = config or load_config()
+
         self.poller = select.poll()
 
         self.devices: dict[str, "evdev.InputDevice"] = {}
         self.fd_to_path: dict[int, str] = {}
+        self.clients: dict[int, tuple[socket.socket, bytearray]] = {}
+        self.sock: socket.socket | None = None
 
         self.armed = False
+        self.idle_seconds = max(0, int(config.get("idle", 0)))
+        self.respect_inhibitors = bool(config.get("respect_inhibitors", True))
+
         self._state_cache: int | None = None
         self._state_at = 0.0
+
+        self._inhibit_cache: bool | None = None
+        self._inhibit_at = 0.0
+
         self._last_refresh = 0.0
+        self._last_idle_check = 0.0
+        self._last_activity = time.monotonic()
+        self._last_wake: float | None = None
+        self._started = time.time()
+
         self._running = True
         self._pending: list[str] = []
+
+    # ---- lifecycle ----
+
+    def start(self) -> None:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            SOCKET_PATH.unlink()
+        except OSError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.setblocking(False)
+        self.sock.bind(str(SOCKET_PATH))
+        self.sock.listen(8)
+        self.poller.register(self.sock.fileno(), select.POLLIN)
 
     # ---- device bookkeeping ----
 
@@ -186,25 +285,53 @@ class Watcher:
         except OSError:
             pass
 
-    def arm(self) -> None:
+    def arm(self) -> bool:
         if self.armed:
-            return
+            return True
         # Only grab when the panel is actually off; otherwise we would
         # silently swallow the user's keystrokes on a visible desktop.
         if self._state(force=True) != POWER_OFF:
-            return
+            return False
         for dev in self.devices.values():
             self._grab(dev)
         self.armed = True
         print("blanket-watcher: armed", flush=True)
+        return True
 
-    def disarm(self) -> None:
+    def disarm(self) -> bool:
         if not self.armed:
-            return
+            return True
         for dev in self.devices.values():
             self._ungrab(dev)
         self.armed = False
         print("blanket-watcher: disarmed", flush=True)
+        return True
+
+    # ---- blanking ----
+
+    def blank(self) -> bool:
+        """Turn the panel off and arm. Rolls back if the grab fails."""
+        set_display_power(POWER_OFF)
+        self._state_cache = POWER_OFF
+        self._state_at = time.monotonic()
+        if not self.arm():
+            # We could not take over the input devices, so the user would be
+            # stranded on a black screen. Restore it instead.
+            set_display_power(POWER_ON)
+            self._state_cache = POWER_ON
+            self._state_at = time.monotonic()
+            print(
+                "blanket-watcher: could not arm; left display on",
+                file=sys.stderr, flush=True,
+            )
+            return False
+        return True
+
+    def unblank(self) -> None:
+        self.disarm()
+        set_display_power(POWER_ON)
+        self._state_cache = POWER_ON
+        self._state_at = time.monotonic()
 
     # ---- display state cache ----
 
@@ -219,6 +346,22 @@ class Watcher:
         self._state_cache = display_power_state()
         self._state_at = now
         return self._state_cache
+
+    def _inhibited(self) -> bool:
+        if not self.respect_inhibitors:
+            return False
+        now = time.monotonic()
+        if (
+            self._inhibit_cache is not None
+            and now - self._inhibit_at < INHIBIT_CACHE_TTL
+        ):
+            return self._inhibit_cache
+        self._inhibit_cache = idle_inhibited()
+        self._inhibit_at = now
+        return self._inhibit_cache
+
+    def idle_time(self) -> float:
+        return time.monotonic() - self._last_activity
 
     # ---- input handling ----
 
@@ -236,13 +379,184 @@ class Watcher:
         if not any(e.type != ecodes.EV_SYN for e in events):
             return
 
+        self._last_activity = time.monotonic()
+
         if self.armed:
             # Swallow the wake key, then wake the display.
             self.disarm()
-            set_display_on()
+            set_display_power(POWER_ON)
             self._state_cache = POWER_ON
             self._state_at = time.monotonic()
+            self._last_wake = time.time()
             print("blanket-watcher: woke display", flush=True)
+
+    def _maybe_idle_blank(self) -> None:
+        if self.armed or self.idle_seconds <= 0:
+            return
+        if self.idle_time() < self.idle_seconds:
+            return
+        if self._inhibited():
+            return
+        if self.blank():
+            print(
+                f"blanket-watcher: idle for {self.idle_seconds}s; blanked",
+                flush=True,
+            )
+        else:
+            # Do not hammer the bus while we cannot arm; retry in a moment.
+            self._last_activity = time.monotonic() - self.idle_seconds + 5.0
+
+    # ---- control socket ----
+
+    def _accept_clients(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            conn.setblocking(False)
+            self.clients[conn.fileno()] = (conn, bytearray())
+            self.poller.register(conn.fileno(), select.POLLIN)
+
+    def _close_client(self, fd: int) -> None:
+        entry = self.clients.pop(fd, None)
+        if entry is None:
+            return
+        conn, _ = entry
+        try:
+            self.poller.unregister(fd)
+        except (KeyError, OSError):
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _service_client(self, fd: int) -> None:
+        entry = self.clients.get(fd)
+        if entry is None:
+            return
+        conn, buf = entry
+        try:
+            data = conn.recv(4096)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            self._close_client(fd)
+            return
+
+        if not data:
+            self._close_client(fd)
+            return
+
+        buf.extend(data)
+        if b"\n" not in buf:
+            if len(buf) > 8192:
+                self._close_client(fd)
+            return
+
+        line, _, _ = bytes(buf).partition(b"\n")
+        try:
+            payload = self._serialize(
+                self._handle_command(line.decode("utf-8", "replace").strip())
+            )
+        except Exception as exc:  # keep the watcher alive on bad input
+            payload = f"ok=false\nerror={exc}\n"
+        try:
+            conn.sendall(payload.encode())
+        except OSError:
+            pass
+        self._close_client(fd)
+
+    @staticmethod
+    def _serialize(resp: dict) -> str:
+        resp = dict(resp)
+        ok = resp.pop("ok", True)
+        out = [f"ok={'true' if ok else 'false'}"]
+        for key, value in resp.items():
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    out.append(f"{key}={item}")
+            else:
+                if isinstance(value, bool):
+                    value = "true" if value else "false"
+                elif value is None:
+                    value = ""
+                out.append(f"{key}={value}")
+        return "\n".join(out) + "\n"
+
+    def _handle_command(self, line: str) -> dict:
+        parts = line.split()
+        cmd = parts[0].lower() if parts else ""
+        if cmd in ("ping", ""):
+            return {"ok": True}
+        if cmd == "status":
+            return {"ok": True, **self.status()}
+        if cmd == "list":
+            devices = [
+                f"{path}|{dev.name}"
+                for path, dev in sorted(self.devices.items())
+            ]
+            return {"ok": True, "count": len(devices), "device": devices}
+        if cmd == "arm":
+            return {"ok": True, "armed": self.arm()}
+        if cmd == "disarm":
+            self.disarm()
+            return {"ok": True, "armed": self.armed}
+        if cmd == "blank":
+            return {"ok": True, "armed": self.blank()}
+        if cmd == "unblank":
+            self.unblank()
+            return {"ok": True, "armed": self.armed}
+        if cmd == "idle":
+            return self._cmd_idle(parts[1:])
+        if cmd == "reload":
+            cfg = load_config()
+            self.idle_seconds = max(0, int(cfg.get("idle", 0)))
+            self.respect_inhibitors = bool(cfg.get("respect_inhibitors", True))
+            return {"ok": True, "idle": self.idle_seconds}
+        return {"ok": False, "error": f"unknown command: {cmd or '(empty)'}"}
+
+    def _cmd_idle(self, args: list[str]) -> dict:
+        if not args or args[0].lower() in ("status", "show"):
+            return {
+                "ok": True,
+                "idle": self.idle_seconds,
+                "idle_for": round(self.idle_time(), 1),
+            }
+        value = args[0].lower()
+        if value in ("off", "none", "disable"):
+            self.idle_seconds = 0
+        else:
+            try:
+                self.idle_seconds = max(0, int(value))
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": "idle expects a number of seconds or 'off'",
+                }
+        # Reset the timer so a freshly configured idle delay starts now.
+        self._last_activity = time.monotonic()
+        return {"ok": True, "idle": self.idle_seconds}
+
+    def status(self) -> dict:
+        return {
+            "pid": os.getpid(),
+            "armed": self.armed,
+            "grabbed": len(self.devices) if self.armed else 0,
+            "devices": len(self.devices),
+            "power": self._state(force=True),
+            "idle": self.idle_seconds,
+            "idle_for": (
+                round(self.idle_time(), 1) if self.idle_seconds else None
+            ),
+            "respect_inhibitors": self.respect_inhibitors,
+            "inhibited": self._inhibited(),
+            "last_wake": self._last_wake,
+            "uptime": round(time.time() - self._started, 1),
+        }
 
     # ---- signal handling ----
 
@@ -269,6 +583,13 @@ class Watcher:
             f"blanket-watcher: watching {len(self.devices)} device(s)",
             flush=True,
         )
+        if self.idle_seconds:
+            print(
+                f"blanket-watcher: idle blanking after {self.idle_seconds}s",
+                flush=True,
+            )
+
+        server_fd = self.sock.fileno() if self.sock else -1
 
         while self._running:
             try:
@@ -277,6 +598,15 @@ class Watcher:
                 events = []
 
             for fd, mask in events:
+                if fd == server_fd:
+                    self._accept_clients()
+                elif fd in self.clients:
+                    if mask & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                        self._close_client(fd)
+                    elif mask & select.POLLIN:
+                        self._service_client(fd)
+                    continue
+
                 path = self.fd_to_path.get(fd)
                 if path is None:
                     continue
@@ -293,6 +623,10 @@ class Watcher:
                 self._refresh_devices()
                 self._last_refresh = now
 
+            if self.idle_seconds > 0 and now - self._last_idle_check >= IDLE_TICK:
+                self._last_idle_check = now
+                self._maybe_idle_blank()
+
         self.shutdown()
 
     def shutdown(self) -> None:
@@ -300,7 +634,25 @@ class Watcher:
         self.disarm()
         if was_armed:
             # Don't leave the user with a blank panel and no watcher.
-            set_display_on()
+            set_display_power(POWER_ON)
+
+        for fd in list(self.clients):
+            self._close_client(fd)
+        if self.sock is not None:
+            try:
+                self.poller.unregister(self.sock.fileno())
+            except (KeyError, OSError):
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        try:
+            SOCKET_PATH.unlink()
+        except OSError:
+            pass
+
         for path in list(self.devices):
             self._remove_device(path)
 
@@ -325,12 +677,23 @@ def _acquire_pidfile() -> None:
             print("blanket-watcher: already running", file=sys.stderr)
             sys.exit(0)
 
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     PIDFILE.write_text(str(os.getpid()))
     atexit.register(lambda: PIDFILE.unlink(missing_ok=True))
 
 
 def main() -> int:
     _acquire_pidfile()
+
+    # Crash recovery: if we are (re)starting while the panel is already blank,
+    # bring it back on so the user is never stranded on a black screen with no
+    # watcher to wake it.
+    if display_power_state() == POWER_OFF:
+        print(
+            "blanket-watcher: screen was blank at startup; restoring",
+            file=sys.stderr, flush=True,
+        )
+        set_display_power(POWER_ON)
 
     watcher = Watcher()
     signal.signal(signal.SIGUSR1, watcher._on_arm)
@@ -339,6 +702,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, watcher.stop)
 
     try:
+        watcher.start()
         watcher.run()
     except Exception as exc:
         watcher.shutdown()
