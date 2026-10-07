@@ -83,12 +83,25 @@ fi
 # --- enable the service ----------------------------------------------------
 
 systemctl --user daemon-reload
+# Clear any prior failed state so a stale "restart counter" from earlier
+# experiments does not trigger immediate rate-limiting on the fresh start.
+systemctl --user reset-failed "$SERVICE" 2>/dev/null || true
 systemctl --user enable --now "$SERVICE"
 
-# Give it a moment to come up, then report whether it actually started.
-sleep 0.5
+# Give it a moment to come up, and make sure it *stayed* up — a crash on
+# start would otherwise be reported as a success (the 0.5s check used to
+# race against the very first restart).
+sleep 2
 if systemctl --user is-active --quiet "$SERVICE"; then
-    say "blanket-watcher service is active."
+    restarts="$(systemctl --user show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)"
+    if [[ "${restarts:-0}" == "0" ]]; then
+        say "blanket-watcher service is active."
+    else
+        warn "blanket-watcher is active but has restarted ${restarts} time(s)."
+        warn "Recent log:"
+        warn
+        journalctl --user -u "$SERVICE" -n 20 --no-pager >&2 || true
+    fi
 else
     warn "blanket-watcher did not start cleanly. Recent log:"
     warn

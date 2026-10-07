@@ -486,15 +486,17 @@ class Watcher:
         storm: every extra modeset is another flash); the read-back below
         only decides whether to log a warning.
         """
-        now = time.monotonic()
         set_display_power(POWER_ON)
         if not await_power_state(POWER_ON, attempts=3):
             print(
                 "blanket-watcher: warning: panel did not report back on",
                 file=sys.stderr, flush=True,
             )
+        # Timestamp the cache *after* the bus round-trips so it starts its
+        # TTL from now, not from before the await (which could already be
+        # older than STATE_CACHE_TTL by the time we get here).
         self._state_cache = POWER_ON
-        self._state_at = now
+        self._state_at = time.monotonic()
         self._last_wake = time.time()
         # Ungrab even if the panel misbehaved: a grabbed keyboard with a
         # lit screen is worse than any power-state mismatch.

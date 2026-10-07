@@ -1,25 +1,12 @@
 [Unit]
 Description=Blanket watcher (wake display on input)
-Documentation=https://github.com/siddhant-jain-18/blanket
 After=graphical-session.target
-PartOf=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/blanket-watcher
 Restart=on-failure
 RestartSec=2
-
-# Clean shutdown: SIGTERM first, then give it a moment before SIGKILL.
-KillMode=mixed
-TimeoutStopSec=5
-
-# Hardening that is safe for systemd --user services. The full sandbox
-# (ProtectSystem, ProtectKernel*, ProtectControlGroups, PrivateTmp) requires
-# CAP_SYS_ADMIN in the user manager, which systemd --user does not have —
-# adding those options causes status=218/CAPABILITIES and the unit never
-# starts. NoNewPrivileges is the one directive that is always safe.
-NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target
