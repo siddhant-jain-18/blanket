@@ -14,17 +14,12 @@ RestartSec=2
 KillMode=mixed
 TimeoutStopSec=5
 
-# Modest hardening — the watcher only needs /dev/input, session D-Bus,
-# and $XDG_RUNTIME_DIR for its socket and pidfile.
+# Hardening that is safe for systemd --user services. The full sandbox
+# (ProtectSystem, ProtectKernel*, ProtectControlGroups, PrivateTmp) requires
+# CAP_SYS_ADMIN in the user manager, which systemd --user does not have —
+# adding those options causes status=218/CAPABILITIES and the unit never
+# starts. NoNewPrivileges is the one directive that is always safe.
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=read-only
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictRealtime=yes
-LockPersonality=yes
 
 [Install]
 WantedBy=default.target
