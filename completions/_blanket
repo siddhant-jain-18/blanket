@@ -18,16 +18,19 @@ _blanket() {
         return
     fi
 
-    case "${words[2]}" in
+    case $words[2] in
         status)
-            _arguments '--verbose[show watcher details]' '-v[show watcher details]'
+            _arguments \
+                '-v[Show watcher details]' \
+                '--verbose[Show watcher details]'
             ;;
         off)
-            _arguments '--force[blank even if the watcher is not running]' \
-                       '-f[blank even if the watcher is not running]'
+            _arguments \
+                '-f[Blank even if the watcher is not running]' \
+                '--force[Blank even if the watcher is not running]'
             ;;
         idle)
-            _values 'seconds, off, or status' off status 60 300 600 900
+            _values 'idle' off status 60 300 600 900
             ;;
     esac
 }

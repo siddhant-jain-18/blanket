@@ -76,6 +76,7 @@ POLL_TIMEOUT_MS = 100        # responsiveness of the signal-driven path
 STATE_CACHE_TTL = 0.4        # seconds a busctl reading stays valid
 INHIBIT_CACHE_TTL = 2.0      # seconds an inhibitor reading stays valid
 IDLE_TICK = 1.0              # seconds between idle-timer evaluations
+DRAIN_LIMIT = 64             # bounded discard of stale events per device
 
 
 # --- configuration ---------------------------------------------------------
@@ -323,7 +324,7 @@ class Watcher:
             dev.grab()
         except OSError as exc:
             print(
-                f"blanket-watcher: grab {dev.path} failed: {exc}",
+                f"blanket-watcher: grab {path or '?'} failed: {exc}",
                 file=sys.stderr, flush=True,
             )
             if path is not None:
@@ -344,7 +345,7 @@ class Watcher:
             if path is not None:
                 self.grabbed.discard(path)
 
-    def _drain(self, dev: "evdev.InputDevice", limit: int = 64) -> None:
+    def _drain(self, dev: "evdev.InputDevice", limit: int = DRAIN_LIMIT) -> None:
         """Discard queued events on one device (bounded).
 
         The cap matters: an actively-used device (mouse being wiggled

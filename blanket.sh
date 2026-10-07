@@ -49,7 +49,7 @@ try:
             break
         buf += chunk
     sys.stdout.write(buf.decode("utf-8", "replace"))
-except Exception as exc:  # surface any failure to the caller
+except Exception as exc:
     sys.stdout.write("ok=false\nerror=%s\n" % exc)
 PY
 }
@@ -61,8 +61,17 @@ _watcher_alive() {
 }
 
 # Read a single `key=` value out of a key=value response body on stdin.
+# Uses awk (not sed|head) so a duplicate key cannot trigger SIGPIPE and
+# kill the script under `set -o pipefail`.
 _field() {
-    sed -n "s/^$1=//p" | head -n1
+    local key="$1"
+    awk -v k="$key" '
+        index($0, k "=") == 1 {
+            sub("^" k "=", "")
+            print
+            exit
+        }
+    '
 }
 
 # --- display state ---------------------------------------------------------

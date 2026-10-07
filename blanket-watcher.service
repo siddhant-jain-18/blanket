@@ -1,12 +1,30 @@
 [Unit]
 Description=Blanket watcher (wake display on input)
+Documentation=https://github.com/siddhant-jain-18/blanket
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/blanket-watcher
 Restart=on-failure
 RestartSec=2
+
+# Clean shutdown: SIGTERM first, then give it a moment before SIGKILL.
+KillMode=mixed
+TimeoutStopSec=5
+
+# Modest hardening — the watcher only needs /dev/input, session D-Bus,
+# and $XDG_RUNTIME_DIR for its socket and pidfile.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=default.target
