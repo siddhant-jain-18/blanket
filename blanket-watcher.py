@@ -374,6 +374,12 @@ class Watcher:
                 ok += 1
         return ok
 
+    def _rollback_grabs(self) -> None:
+        """Release any grabs we managed to acquire during a failed arm/blank."""
+        for dev in self.devices.values():
+            self._ungrab(dev)
+        self.grabbed.clear()
+
     def arm(self) -> bool:
         if self.armed:
             return True
@@ -383,7 +389,12 @@ class Watcher:
             return False
         grabbed = self._grab_all()
         self._drain_all()
-        if self.devices and grabbed == 0:
+        # An *empty* device list is as bad as a failed grab: with nothing
+        # grabbed nothing can wake us, so arming would strand the user on
+        # a black screen.  This is the case that the previous
+        # `if self.devices and …` check silently let through.
+        if grabbed == 0:
+            self._rollback_grabs()
             print(
                 "blanket-watcher: arm refused: could not grab any device",
                 file=sys.stderr, flush=True,
@@ -432,7 +443,13 @@ class Watcher:
         #    through to Mutter (which would auto-unblank on input).
         grabbed = self._grab_all()
         self._drain_all()
-        if self.devices and grabbed == 0:
+        # A successful grab — at least one device — is a hard precondition.
+        # With *zero* grabbed devices (no wake devices discovered yet, none
+        # in the `input` group, or every grab held by another process)
+        # nothing can wake the panel, so blanking would leave the user on a
+        # black screen with no way back.
+        if grabbed == 0:
+            self._rollback_grabs()
             print(
                 "blanket-watcher: could not grab any input device; "
                 "left display on",
@@ -442,9 +459,7 @@ class Watcher:
 
         # 2. Now it is safe to switch the panel off.
         if not set_display_power(POWER_OFF):
-            for dev in self.devices.values():
-                self._ungrab(dev)
-            self.grabbed.clear()
+            self._rollback_grabs()
             print(
                 "blanket-watcher: could not blank display; left display on",
                 file=sys.stderr, flush=True,
@@ -455,9 +470,7 @@ class Watcher:
         #    for it to show up instead of treating a stale read-back as a
         #    failure (that false rollback is a flash-off-and-back-on).
         if not await_power_state(POWER_OFF):
-            for dev in self.devices.values():
-                self._ungrab(dev)
-            self.grabbed.clear()
+            self._rollback_grabs()
             set_display_power(POWER_ON)
             print(
                 "blanket-watcher: panel never went off; left display on",
@@ -504,6 +517,11 @@ class Watcher:
         # We swallowed everything while armed, so the session still looks
         # idle to GNOME — tell it the user is here before it re-blanks us.
         poke_session_activity()
+        # Restart the idle clock: the user is by definition present now.
+        # Without this, `blanket on` (or any wake that lands while the
+        # idle timer is already expired) is followed on the very next tick
+        # by an immediate re-blank.
+        self._last_activity = time.monotonic()
         print("blanket-watcher: woke display", flush=True)
 
     def unblank(self) -> None:
@@ -871,20 +889,38 @@ class Watcher:
 
 # --- entry point -----------------------------------------------------------
 
+def _pid_is_watcher(pid: int) -> bool:
+    """True if `pid` names a live blanket-watcher process.
+
+    `os.kill(pid, 0)` only proves *some* process holds the PID; PIDs are
+    recycled constantly, so a stale pidfile could otherwise block the
+    service from starting after any reboot.  Read the process's command
+    line from /proc instead — that contains the script name in every way
+    the watcher is realistically launched.
+    """
+    if pid <= 0:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return b"blanket-watcher" in fh.read()
+    except OSError:
+        return False
+
+
 def _acquire_pidfile() -> None:
     if PIDFILE.exists():
         try:
             pid = int(PIDFILE.read_text().strip())
-            os.kill(pid, 0)
         except (ValueError, OSError):
-            # Stale or unreadable; clean it up.
-            try:
-                PIDFILE.unlink()
-            except OSError:
-                pass
-        else:
+            pid = 0
+        if pid and _pid_is_watcher(pid):
             print("blanket-watcher: already running", file=sys.stderr)
             sys.exit(0)
+        # Stale, unreadable, or pointing at an unrelated (recycled) PID.
+        try:
+            PIDFILE.unlink()
+        except OSError:
+            pass
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     PIDFILE.write_text(str(os.getpid()))

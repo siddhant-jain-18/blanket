@@ -104,7 +104,7 @@ This carries values (unlike signals), cannot lose commands, and lets
 - `blanket off` will **not** blank the screen unless the watcher answers on the
   socket, unless you pass `--force`. Blanking with no watcher is the one state
   from which there is no way back.
-- If the watcher cannot grab the input devices after blanking, it immediately
+- If the watcher cannot grab any input device — no wake-capable devices discovered, no `input` group membership, or every grab held by another process — it refuses to blank at all, and the display stays on. Blanking with no way to wake it is the one state from which there is no recovery.
   turns the display back on.
 - If the watcher starts up (e.g. after a crash or `systemctl --user restart`)
   while the screen is blank, it restores the display on startup.

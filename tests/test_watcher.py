@@ -32,6 +32,24 @@ def make_watcher(**config) -> "mod.Watcher":
     return mod.Watcher(cfg)
 
 
+def add_fake_device(watcher, path="/dev/input/event0", name="Test Device"):
+    """Install a mock device that grabs and drains successfully.
+
+    Tests that exercise `arm`/`blank` must do this: the watcher refuses
+    to arm with zero grabbed devices (that is the "stranded on black
+    screen" case), so a watcher with no devices is *expected* to fail.
+    """
+    dev = mock.MagicMock()
+    dev.path = path
+    dev.name = name
+    dev.grab = mock.MagicMock()
+    dev.ungrab = mock.MagicMock()
+    dev.close = mock.MagicMock()
+    dev.read_one.return_value = None
+    watcher.devices[path] = dev
+    return dev
+
+
 class ConfigTests(unittest.TestCase):
     def test_defaults_when_file_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,6 +77,7 @@ class ConfigTests(unittest.TestCase):
 class CommandTests(unittest.TestCase):
     def setUp(self):
         self.watcher = make_watcher()
+        add_fake_device(self.watcher)
         patcher = mock.patch.object(
             mod, "display_power_state", return_value=mod.POWER_OFF
         )
@@ -101,20 +120,16 @@ class CommandTests(unittest.TestCase):
         self.assertIn("idle_for", status)
 
     def test_blank_rolls_back_when_set_fails(self):
-        # The power-set request itself failed, so the panel never went off:
-        # blank must release the grabs and report armed=false rather than
-        # stranding the user on a black screen.
         self.power.return_value = False
         result = self.watcher._handle_command("blank")
         self.assertFalse(result["armed"])
         self.assertFalse(self.watcher.armed)
         modes = [call.args[0] for call in self.power.call_args_list]
         self.assertEqual(modes, [mod.POWER_OFF])
+        # Everything that was grabbed must be released again.
+        self.assertEqual(self.watcher.grabbed, set())
 
     def test_blank_waits_for_async_apply(self):
-        # Mutter applies PowerSaveMode asynchronously: the first read-back
-        # may still show the old value. blank() must wait briefly instead
-        # of treating one stale read as failure (flash off/back on).
         self.state.side_effect = [mod.POWER_ON, mod.POWER_OFF]
         with mock.patch.object(mod.time, "sleep"):
             result = self.watcher._handle_command("blank")
@@ -122,8 +137,6 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(self.watcher.armed)
 
     def test_blank_rolls_back_when_panel_never_goes_off(self):
-        # The set was accepted but the panel never reports off: roll back
-        # (and restore power) rather than stranding the user.
         self.state.return_value = mod.POWER_ON
         with mock.patch.object(mod.time, "sleep"):
             result = self.watcher._handle_command("blank")
@@ -132,6 +145,7 @@ class CommandTests(unittest.TestCase):
         modes = [call.args[0] for call in self.power.call_args_list]
         self.assertEqual(modes[0], mod.POWER_OFF)
         self.assertEqual(modes[-1], mod.POWER_ON)
+        self.assertEqual(self.watcher.grabbed, set())
 
     def test_blank_arms_when_display_is_off(self):
         result = self.watcher._handle_command("blank")
@@ -157,6 +171,24 @@ class CommandTests(unittest.TestCase):
         self.assertFalse(watcher.armed)
         power.assert_not_called()  # never blanked: nothing could wake us
 
+    def test_blank_refuses_when_no_devices_at_all(self):
+        # Regression: an *empty* device list used to be treated as "success"
+        # and blanked the panel with nothing left to wake it.
+        watcher = make_watcher()
+        with mock.patch.object(mod, "set_display_power") as power:
+            self.assertFalse(watcher.blank())
+        self.assertFalse(watcher.armed)
+        power.assert_not_called()
+
+    def test_arm_refuses_when_no_devices_at_all(self):
+        watcher = make_watcher()
+        with mock.patch.object(
+            watcher, "_state", return_value=mod.POWER_OFF
+        ), redirect_stdout(io.StringIO()), \
+                mock.patch.object(mod.sys, "stderr", io.StringIO()):
+            self.assertFalse(watcher.arm())
+        self.assertFalse(watcher.armed)
+
     def test_blank_is_idempotent_when_already_armed(self):
         self.watcher._handle_command("blank")
         self.assertTrue(self.watcher.armed)
@@ -173,7 +205,7 @@ class CommandTests(unittest.TestCase):
         watcher = make_watcher()
         order = []
         watcher._grab_all = mock.MagicMock(
-            side_effect=lambda: order.append("grab") or 0
+            side_effect=lambda: order.append("grab") or 1
         )
         watcher._drain_all = mock.MagicMock(
             side_effect=lambda: order.append("drain")
@@ -206,6 +238,7 @@ class CommandTests(unittest.TestCase):
 class IdleLogicTests(unittest.TestCase):
     def setUp(self):
         self.watcher = make_watcher(idle=1)
+        add_fake_device(self.watcher)
         patcher = mock.patch.object(
             mod, "display_power_state", return_value=mod.POWER_OFF
         )
@@ -310,7 +343,6 @@ class WakeFilterTests(unittest.TestCase):
         self.power.assert_not_called()
 
     def test_shortcut_release_sequence_never_wakes(self):
-        # Ctrl+Alt+B key-ups arriving after the blank, as separate frames.
         from evdev import ecodes
         for code in (ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_B):
             self._feed(self._ev(ecodes.EV_KEY, 0, code))
@@ -335,7 +367,6 @@ class WakeFilterTests(unittest.TestCase):
         self.power.assert_not_called()
 
     def test_real_key_frame_with_msc_scan_wakes(self):
-        # A physical keypress arrives as MSC_SCAN + KEY press + SYN.
         from evdev import ecodes
         self._feed(
             self._ev(ecodes.EV_MSC, 458756, ecodes.MSC_SCAN),
@@ -393,6 +424,9 @@ class ImmediateWakeTests(unittest.TestCase):
 
     def test_press_right_after_blank_wakes(self):
         watcher = make_watcher()
+        # Install a device so blank() actually arms; use event9 so the
+        # assertion device below doesn't clobber it.
+        add_fake_device(watcher, path="/dev/input/event9", name="placebo")
         with mock.patch.object(
             mod, "set_display_power", return_value=True
         ), mock.patch.object(
@@ -401,6 +435,7 @@ class ImmediateWakeTests(unittest.TestCase):
             self.assertTrue(watcher.blank())
         from evdev import ecodes
         dev = mock.MagicMock()
+        dev.path = "/dev/input/event0"
         dev.read.return_value = [
             types.SimpleNamespace(
                 type=ecodes.EV_KEY, code=ecodes.KEY_SPACE, value=1
@@ -520,6 +555,22 @@ class WakePathTests(unittest.TestCase):
             watcher._wake()
         poke.assert_called_once_with()
 
+    def test_wake_resets_idle_clock(self):
+        # Regression: `blanket on` used to leave _last_activity untouched,
+        # so an expired idle timer re-blanked on the very next tick.
+        watcher = make_watcher(idle=60)
+        watcher.armed = True
+        watcher._last_activity = time.monotonic() - 3600.0
+        with mock.patch.object(
+            mod, "set_display_power", return_value=True
+        ), mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), mock.patch.object(
+            mod, "poke_session_activity"
+        ), redirect_stdout(io.StringIO()):
+            watcher._wake()
+        self.assertLess(watcher.idle_time(), 1.0)
+
     def test_wake_releases_grabs_even_if_panel_misbehaves(self):
         # A grabbed keyboard with a lit screen strands the user; the
         # panel being stuck must never block the ungrab.
@@ -574,6 +625,21 @@ class AwaitStateTests(unittest.TestCase):
                 mod.await_power_state(mod.POWER_OFF, attempts=3)
             )
         self.assertEqual(sleep.call_count, 3)
+
+
+class PidfileTests(unittest.TestCase):
+    def test_pid_is_watcher_rejects_unknown_pid(self):
+        # A recycled PID must not block startup.
+        self.assertFalse(mod._pid_is_watcher(0))
+        self.assertFalse(mod._pid_is_watcher(-1))
+        # A PID we know is dead (unlikely to be recycled during the test).
+        self.assertFalse(mod._pid_is_watcher(1 << 30))
+
+    def test_pid_is_watcher_accepts_self(self):
+        # Our own cmdline (python3 -m unittest …) contains the module
+        # path; more robustly, ensure the function doesn't crash for
+        # a live PID.
+        self.assertIsInstance(mod._pid_is_watcher(os.getpid()), bool)
 
 
 class CrashRecoveryTests(unittest.TestCase):

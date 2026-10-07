@@ -30,6 +30,11 @@ CONFIG_FILE="$CONFIG_DIR/config"
 
 # Send a command to the watcher over its control socket. The response is a
 # series of `key=value` lines whose first line is `ok=true` or `ok=false`.
+#
+# NOTE: the watcher replies with *multiple* lines and then closes the
+# connection.  We must read until EOF — reading only up to the first "\n"
+# truncates every response to just "ok=true", which silently broke
+# `status -v`, `list` and `idle status`.
 _ctl() {
     python3 - "$SOCKET_PATH" "$@" 2>/dev/null <<'PY'
 import socket
@@ -39,24 +44,26 @@ path, *args = sys.argv[1:]
 message = (" ".join(args) + "\n").encode()
 try:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(3.0)
+    sock.settimeout(5.0)
     sock.connect(path)
     sock.sendall(message)
     buf = b""
-    while b"\n" not in buf:
+    while True:
         chunk = sock.recv(4096)
         if not chunk:
             break
         buf += chunk
     sys.stdout.write(buf.decode("utf-8", "replace"))
+    sys.stdout.flush()
 except Exception as exc:
     sys.stdout.write("ok=false\nerror=%s\n" % exc)
+    sys.stdout.flush()
 PY
 }
 
 _watcher_alive() {
     local out
-    out="$(_ctl ping)"
+    out="$(_ctl ping || true)"
     [[ "$out" == ok=true* ]]
 }
 
@@ -173,9 +180,15 @@ EOF
     fi
 
     local out
-    out="$(_ctl blank)"
+    out="$(_ctl blank || true)"
     if [[ "$out" != ok=true* ]]; then
-        echo "blanket: failed to blank ($(printf '%s' "$out" | _field error))" >&2
+        local err
+        err="$(printf '%s' "$out" | _field error)"
+        if [[ -n "$err" ]]; then
+            echo "blanket: failed to blank ($err)" >&2
+        else
+            echo "blanket: failed to blank" >&2
+        fi
         return 1
     fi
     if [[ "$out" == *armed=false* ]]; then
@@ -185,10 +198,13 @@ EOF
 }
 
 cmd_on() {
-    # Unblanking is always safe, so it works even if the watcher is down.
-    if _watcher_alive; then
-        _ctl unblank >/dev/null 2>&1 || _set_mode "$POWER_ON"
-    else
+    # Unblanking is always safe. Try the watcher first so it disarms
+    # cleanly, but fall back to a direct modeset when the watcher is
+    # unreachable or refused — otherwise a watcher that died mid-command
+    # would leave the panel off forever.
+    local out
+    out="$(_ctl unblank || true)"
+    if [[ "$out" != ok=true* ]]; then
         _set_mode "$POWER_ON"
     fi
 }
@@ -222,7 +238,7 @@ cmd_status() {
     fi
 
     local out armed grabbed devices idle idle_for inhibited last_wake uptime
-    out="$(_ctl status)"
+    out="$(_ctl status || true)"
     armed="$(_field armed <<<"$out")"
     grabbed="$(_field grabbed <<<"$out")"
     devices="$(_field devices <<<"$out")"
@@ -257,7 +273,7 @@ cmd_list() {
         return 1
     fi
     local out found=0 line entry
-    out="$(_ctl list)"
+    out="$(_ctl list || true)"
     while IFS= read -r line; do
         case "$line" in
             device=*)
@@ -304,7 +320,7 @@ _idle_show() {
     local idle idle_for=""
     if _watcher_alive; then
         local out
-        out="$(_ctl idle status)"
+        out="$(_ctl idle status || true)"
         idle="$(_field idle <<<"$out")"
         idle_for="$(_field idle_for <<<"$out")"
     else
@@ -361,7 +377,7 @@ cmd_doctor() {
     if _watcher_alive; then
         echo "  [ok]   blanket-watcher is running"
         local out count
-        out="$(_ctl list)"
+        out="$(_ctl list || true)"
         count="$(_field count <<<"$out")"
         if [[ "${count:-0}" -gt 0 ]]; then
             echo "  [ok]   watcher sees ${count} input device(s)"
