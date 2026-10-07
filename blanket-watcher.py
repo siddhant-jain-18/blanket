@@ -76,6 +76,7 @@ POLL_TIMEOUT_MS = 100        # responsiveness of the signal-driven path
 STATE_CACHE_TTL = 0.4        # seconds a busctl reading stays valid
 INHIBIT_CACHE_TTL = 2.0      # seconds an inhibitor reading stays valid
 IDLE_TICK = 1.0              # seconds between idle-timer evaluations
+SETTLE_DELAY = 0.6           # seconds after blank during which releases are ignored
 
 
 # --- configuration ---------------------------------------------------------
@@ -203,6 +204,7 @@ class Watcher:
         self._last_refresh = 0.0
         self._last_idle_check = 0.0
         self._last_activity = time.monotonic()
+        self._blanked_at = 0.0
         self._last_wake: float | None = None
         self._started = time.time()
 
@@ -278,12 +280,36 @@ class Watcher:
                 f"blanket-watcher: grab {dev.path} failed: {exc}",
                 file=sys.stderr, flush=True,
             )
+        else:
+            # Discard anything queued before the grab (e.g. the key-up
+            # events from the Ctrl+Alt+B / Enter that invoked us), so a
+            # stale release is never mistaken for a fresh wake gesture.
+            self._drain(dev)
 
     def _ungrab(self, dev: "evdev.InputDevice") -> None:
         try:
             dev.ungrab()
         except OSError:
             pass
+
+    def _drain(self, dev: "evdev.InputDevice") -> None:
+        """Discard all currently queued events on one device."""
+        read_one = getattr(dev, "read_one", None)
+        if read_one is None:
+            return
+        try:
+            while read_one() is not None:
+                pass
+        except (OSError, AttributeError):
+            pass
+
+    def _drain_all(self) -> None:
+        for dev in self.devices.values():
+            self._drain(dev)
+
+    def _grab_all(self) -> None:
+        for dev in self.devices.values():
+            self._grab(dev)
 
     def arm(self) -> bool:
         if self.armed:
@@ -292,9 +318,10 @@ class Watcher:
         # silently swallow the user's keystrokes on a visible desktop.
         if self._state(force=True) != POWER_OFF:
             return False
-        for dev in self.devices.values():
-            self._grab(dev)
+        self._grab_all()
+        self._drain_all()
         self.armed = True
+        self._blanked_at = time.monotonic()
         print("blanket-watcher: armed", flush=True)
         return True
 
@@ -310,13 +337,40 @@ class Watcher:
     # ---- blanking ----
 
     def blank(self) -> bool:
-        """Turn the panel off and arm. Rolls back if the grab fails."""
+        """Turn the panel off and arm. Rolls back if the grab fails.
+
+        The grab happens *before* the panel is switched off so the
+        key-release events from the shortcut that invoked us (Ctrl+Alt+B,
+        Enter, …) can never reach the compositor in the window between
+        "display off" and "inputs grabbed" — that window is what used to
+        wake the screen straight back up.
+        """
+        # 1. Pre-grab: swallow the trigger keystrokes before they leak
+        #    through to Mutter (which would auto-unblank on input).
+        self._grab_all()
+        self._drain_all()
+        self.armed = True
+        self._blanked_at = time.monotonic()
+
+        # 2. Now it is safe to switch the panel off.
         set_display_power(POWER_OFF)
         self._state_cache = POWER_OFF
         self._state_at = time.monotonic()
-        if not self.arm():
-            # We could not take over the input devices, so the user would be
-            # stranded on a black screen. Restore it instead.
+
+        # 3. Discard anything that arrived during the bus round-trip and
+        #    (re)start the settle window + idle clock from a clean slate.
+        self._drain_all()
+        now = time.monotonic()
+        self._blanked_at = now
+        self._last_activity = now
+
+        # 4. Verify the panel really went off. If Mutter refused (or
+        #    auto-woke on an event we could not swallow), roll back rather
+        #    than stranding the user on a black screen with no way back.
+        if self._state(force=True) != POWER_OFF:
+            for dev in self.devices.values():
+                self._ungrab(dev)
+            self.armed = False
             set_display_power(POWER_ON)
             self._state_cache = POWER_ON
             self._state_at = time.monotonic()
@@ -325,6 +379,7 @@ class Watcher:
                 file=sys.stderr, flush=True,
             )
             return False
+        print("blanket-watcher: armed", flush=True)
         return True
 
     def unblank(self) -> None:
@@ -365,6 +420,23 @@ class Watcher:
 
     # ---- input handling ----
 
+    @staticmethod
+    def _is_wake_event(events) -> bool:
+        """True if the frame holds a genuine wake gesture.
+
+        Key/button *releases* (value 0) are ignored — they are almost
+        always the tail end of the shortcut that blanked the screen.
+        Presses, repeats, pointer motion and switch events all wake.
+        """
+        for e in events:
+            if e.type == ecodes.EV_KEY:
+                if e.value != 0:  # press (1) or autorepeat (2)
+                    return True
+            elif e.type in (ecodes.EV_REL, ecodes.EV_ABS, ecodes.EV_SW):
+                return True
+            # EV_SYN / EV_MSC and anything else: not a wake gesture.
+        return False
+
     def _handle_input(self, path: str) -> None:
         dev = self.devices.get(path)
         if dev is None:
@@ -379,16 +451,28 @@ class Watcher:
         if not any(e.type != ecodes.EV_SYN for e in events):
             return
 
-        self._last_activity = time.monotonic()
+        now = time.monotonic()
+        self._last_activity = now
 
-        if self.armed:
-            # Swallow the wake key, then wake the display.
-            self.disarm()
-            set_display_power(POWER_ON)
-            self._state_cache = POWER_ON
-            self._state_at = time.monotonic()
-            self._last_wake = time.time()
-            print("blanket-watcher: woke display", flush=True)
+        if not self.armed:
+            return
+
+        # Settle window: right after blanking, the input queue still holds
+        # the key-ups from the shortcut that triggered us. Swallow them.
+        if now - self._blanked_at < SETTLE_DELAY:
+            return
+
+        # Swallow releases; only a real press/motion wakes the display.
+        if not self._is_wake_event(events):
+            return
+
+        # Swallow the wake key, then wake the display.
+        self.disarm()
+        set_display_power(POWER_ON)
+        self._state_cache = POWER_ON
+        self._state_at = now
+        self._last_wake = time.time()
+        print("blanket-watcher: woke display", flush=True)
 
     def _maybe_idle_blank(self) -> None:
         if self.armed or self.idle_seconds <= 0:
