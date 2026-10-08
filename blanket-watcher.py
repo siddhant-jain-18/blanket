@@ -21,6 +21,16 @@ idle [N|off|status], reload.
 
 Runs as a systemd user service. The user must be in the `input` group to
 read /dev/input/event*.
+
+Safety properties:
+
+  * never blanks unless at least one input device is grabbed (otherwise
+    nothing could wake the panel);
+  * waits for the keys that invoked `blank` to be physically released
+    before grabbing, so the compositor never sees stuck keys;
+  * swallows the whole wake gesture (press *and* release) before handing
+    the devices back, bounded by RELEASE_HOLD;
+  * restores the panel on shutdown and on startup if it was left blank.
 """
 
 from __future__ import annotations
@@ -30,6 +40,7 @@ import os
 import select
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -77,6 +88,9 @@ STATE_CACHE_TTL = 0.4        # seconds a busctl reading stays valid
 INHIBIT_CACHE_TTL = 2.0      # seconds an inhibitor reading stays valid
 IDLE_TICK = 1.0              # seconds between idle-timer evaluations
 DRAIN_LIMIT = 64             # bounded discard of stale events per device
+RELEASE_WAIT = 1.5           # max seconds to wait for held keys before blanking
+RELEASE_HOLD = 1.5           # max seconds to keep swallowing a wake gesture
+CLIENT_TIMEOUT = 5.0         # drop control clients that never finish a request
 
 
 # --- configuration ---------------------------------------------------------
@@ -162,29 +176,6 @@ def idle_inhibited() -> bool:
     return bool(out) and out[-1].lower() == "true"
 
 
-def poke_session_activity() -> None:
-    """Deactivate any desktop-side blank curtain (best effort, never raises).
-
-    While the panel is off we swallow every input event, so the session
-    can go idle underneath us and GNOME may draw its own blank on top.
-    Restoring panel power alone then shows a lit-but-black screen (the
-    "flicker with no desktop"). Explicitly deactivating the session
-    blank after powering the panel on hands the visible desktop back.
-    """
-    targets = (
-        # bus, object, interface, method, signature, args…
-        ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
-         "org.gnome.ScreenSaver", "SetActive", "b", "false"),
-        ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver",
-         "org.freedesktop.ScreenSaver", "SetActive", "b", "false"),
-    )
-    for bus, obj, iface, method, sig, *args in targets:
-        try:
-            _busctl("call", bus, obj, iface, method, sig, *args)
-        except Exception:
-            pass
-
-
 def await_power_state(mode: int, attempts: int = 5,
                       delay: float = 0.1) -> bool:
     """Poll until the compositor reports `mode`, or give up.
@@ -202,6 +193,16 @@ def await_power_state(mode: int, attempts: int = 5,
 
 
 # --- device classification -------------------------------------------------
+
+def _pressed_keys(dev) -> list:
+    """Keys/buttons currently held down on `dev` (best effort, never raises)."""
+    try:
+        keys = dev.active_keys()
+    except (OSError, AttributeError, TypeError):
+        return []
+    return list(keys) if isinstance(keys, (list, tuple, set)) else []
+
+
 
 def _is_wake_device(dev: "evdev.InputDevice") -> bool:
     """Keyboards, touchpads and mice; excludes accelerometers etc."""
@@ -231,6 +232,9 @@ class Watcher:
         self.sock: socket.socket | None = None
 
         self.armed = False
+        self._releasing = False          # wake gesture still being swallowed
+        self._release_deadline = 0.0
+        self.client_born: dict[int, float] = {}
         self.grabbed: set[str] = set()
         self.idle_seconds = max(0, int(config.get("idle", 0)))
         self.respect_inhibitors = bool(config.get("respect_inhibitors", True))
@@ -260,7 +264,11 @@ class Watcher:
             pass
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.setblocking(False)
-        self.sock.bind(str(SOCKET_PATH))
+        old_umask = os.umask(0o077)       # socket is user-private from birth
+        try:
+            self.sock.bind(str(SOCKET_PATH))
+        finally:
+            os.umask(old_umask)
         self.sock.listen(8)
         self.poller.register(self.sock.fileno(), select.POLLIN)
 
@@ -292,7 +300,7 @@ class Watcher:
             self.poller.unregister(dev.fd)
         except (KeyError, OSError):
             pass
-        if self.armed:
+        if self.armed or self._releasing or path in self.grabbed:
             self._ungrab(dev)
         try:
             dev.close()
@@ -405,14 +413,53 @@ class Watcher:
         return True
 
     def disarm(self) -> bool:
-        if not self.armed:
+        if not self.armed and not self._releasing:
             return True
+        was_armed = self.armed
         for dev in self.devices.values():
             self._ungrab(dev)
         self.grabbed.clear()
         self.armed = False
-        print("blanket-watcher: disarmed", flush=True)
+        self._releasing = False
+        if was_armed:
+            print("blanket-watcher: disarmed", flush=True)
         return True
+
+    # ---- held-key handling ----
+
+    def _any_pressed(self) -> bool:
+        return any(_pressed_keys(dev) for dev in self.devices.values())
+
+    def _wait_for_release(self, timeout: float = RELEASE_WAIT) -> bool:
+        """Wait until no key/button is held on any watched device.
+
+        `blanket off` is normally fired by a keyboard shortcut, so its keys
+        are still down when we get here.  If we grab the keyboard now, the
+        compositor never sees the key-up events: it believes Ctrl+Alt+B is
+        still held (stuck modifiers, shortcuts that stop working, key
+        repeat that re-fires the shortcut — i.e. flicker).  Waiting for the
+        physical release first lets the compositor finish the gesture.
+        Bounded: a genuinely stuck key never blocks blanking forever.
+        """
+        deadline = time.monotonic() + timeout
+        while self._any_pressed():
+            if time.monotonic() >= deadline:
+                print(
+                    "blanket-watcher: keys still held after "
+                    f"{timeout:.1f}s; blanking anyway",
+                    file=sys.stderr, flush=True,
+                )
+                return False
+            time.sleep(0.02)
+        return True
+
+    def _tick_release(self) -> None:
+        """Finish swallowing a wake gesture, then hand the devices back."""
+        if not self._releasing:
+            return
+        if self._any_pressed() and time.monotonic() < self._release_deadline:
+            return
+        self.disarm()
 
     # ---- blanking ----
 
@@ -438,6 +485,11 @@ class Watcher:
             self._drain_all()
             self._last_activity = time.monotonic()
             return True
+
+        # 0. Let the shortcut that invoked us finish (see _wait_for_release),
+        #    and settle any wake gesture that is still being swallowed.
+        self.disarm()
+        self._wait_for_release()
 
         # 1. Pre-grab: swallow the trigger keystrokes before they leak
         #    through to Mutter (which would auto-unblank on input).
@@ -489,7 +541,7 @@ class Watcher:
         print("blanket-watcher: armed", flush=True)
         return True
 
-    def _wake(self) -> None:
+    def _wake(self, reason: str = "request") -> None:
         """Restore the panel and hand inputs back (never leaves a grab).
 
         Power is restored *before* the grabs are released: the moment
@@ -513,19 +565,36 @@ class Watcher:
         self._last_wake = time.time()
         # Ungrab even if the panel misbehaved: a grabbed keyboard with a
         # lit screen is worse than any power-state mismatch.
-        self.disarm()
-        # We swallowed everything while armed, so the session still looks
-        # idle to GNOME — tell it the user is here before it re-blanks us.
-        poke_session_activity()
+        #
+        # If the wake gesture is still in progress (key held, finger on
+        # the touchpad) keep swallowing it until it ends, so the
+        # compositor never sees a half-finished gesture or kernel
+        # auto-repeat.  _tick_release() hands the devices back, bounded
+        # by RELEASE_HOLD so we can never strand the user.
+        if self.armed and self._any_pressed():
+            self.armed = False
+            self._releasing = True
+            self._release_deadline = time.monotonic() + RELEASE_HOLD
+        else:
+            self.disarm()
         # Restart the idle clock: the user is by definition present now.
         # Without this, `blanket on` (or any wake that lands while the
         # idle timer is already expired) is followed on the very next tick
         # by an immediate re-blank.
         self._last_activity = time.monotonic()
-        print("blanket-watcher: woke display", flush=True)
+        print(f"blanket-watcher: woke display ({reason})", flush=True)
 
     def unblank(self) -> None:
-        self._wake()
+        # Nothing to undo when the panel is already on and we hold no grabs.
+        # (An unconditional modeset here is a pointless visible flash.)
+        # A failed read-back (None) falls through: fail awake.
+        if (
+            not self.armed
+            and not self._releasing
+            and self._state(force=True) == POWER_ON
+        ):
+            return
+        self._wake("unblank")
 
     # ---- display state cache ----
 
@@ -584,6 +653,17 @@ class Watcher:
             # EV_SYN / EV_MSC and anything else: not a wake gesture.
         return False
 
+    @staticmethod
+    def _describe_wake(dev, events) -> str:
+        """Short, loggable description of what woke the display."""
+        for e in events:
+            if e.type == ecodes.EV_SYN:
+                continue
+            name = getattr(dev, "name", "?")
+            kind = ecodes.EV.get(e.type, e.type)
+            return f"{name}: {kind} code={e.code} value={e.value}"
+        return "unknown"
+
     def _handle_input(self, path: str) -> None:
         dev = self.devices.get(path)
         if dev is None:
@@ -613,7 +693,7 @@ class Watcher:
 
         # The wake keypress was already swallowed by the grab; restore the
         # panel and hand the devices back.
-        self._wake()
+        self._wake(self._describe_wake(dev, events))
 
     def _maybe_idle_blank(self) -> None:
         if self.armed or self.idle_seconds <= 0:
@@ -641,11 +721,37 @@ class Watcher:
                 break
             except OSError:
                 break
+            if not self._peer_is_me(conn):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
             conn.setblocking(False)
             self.clients[conn.fileno()] = (conn, bytearray())
+            self.client_born[conn.fileno()] = time.monotonic()
             self.poller.register(conn.fileno(), select.POLLIN)
 
+    @staticmethod
+    def _peer_is_me(conn: socket.socket) -> bool:
+        """Only the owning user may drive the watcher (SO_PEERCRED)."""
+        try:
+            creds = conn.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            _pid, uid, _gid = struct.unpack("3i", creds)
+        except (OSError, AttributeError, struct.error):
+            return True  # platform without SO_PEERCRED: the 0600 socket guards us
+        return uid == os.getuid()
+
+    def _reap_stale_clients(self) -> None:
+        now = time.monotonic()
+        for fd, born in list(self.client_born.items()):
+            if fd in self.clients and now - born > CLIENT_TIMEOUT:
+                self._close_client(fd)
+
     def _close_client(self, fd: int) -> None:
+        self.client_born.pop(fd, None)
         entry = self.clients.pop(fd, None)
         if entry is None:
             return
@@ -770,7 +876,7 @@ class Watcher:
         return {
             "pid": os.getpid(),
             "armed": self.armed,
-            "grabbed": len(self.grabbed) if self.armed else 0,
+            "grabbed": len(self.grabbed),
             "devices": len(self.devices),
             "power": self._state(force=True),
             "idle": self.idle_seconds,
@@ -825,7 +931,8 @@ class Watcher:
             for fd, mask in events:
                 if fd == server_fd:
                     self._accept_clients()
-                elif fd in self.clients:
+                    continue
+                if fd in self.clients:
                     if mask & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
                         self._close_client(fd)
                     elif mask & select.POLLIN:
@@ -842,6 +949,8 @@ class Watcher:
                     self._handle_input(path)
 
             self._drain_pending()
+            self._tick_release()
+            self._reap_stale_clients()
 
             now = time.monotonic()
             if now - self._last_refresh >= REFRESH_INTERVAL:

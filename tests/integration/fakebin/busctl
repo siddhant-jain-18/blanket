@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# fake busctl: state in $FAKE_DIR
+D="${FAKE_DIR:?}"
+echo "$(date +%s.%N) $*" >> "$D/busctl.log"
+args=("$@")
+[[ "${args[0]}" == "--user" ]] && args=("${args[@]:1}")
+case "${args[0]}" in
+  get-property)
+    [[ "${args[4]}" == "PowerSaveMode" ]] && { echo "i $(cat "$D/mode" 2>/dev/null || echo 0)"; exit 0; } ;;
+  set-property)
+    if [[ "${args[4]}" == "PowerSaveMode" ]]; then
+      sleep "${FAKE_APPLY_DELAY:-0}"
+      echo "${args[6]}" > "$D/mode"; exit 0
+    fi ;;
+  call)
+    case "${args[4]}" in
+      IsInhibited) echo "b false"; exit 0 ;;
+      SetActive) echo "SETACTIVE ${args[*]}" >> "$D/screensaver.log"; exit 0 ;;
+    esac ;;
+esac
+exit 1

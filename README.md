@@ -51,6 +51,8 @@ blanket idle off       # Disable idle auto-blanking
 blanket idle           # Show the current idle setting
 blanket list           # List the input devices the watcher has detected
 blanket doctor         # Diagnose the most common setup problems
+blanket logs [N]       # Last N lines of the watcher log (default 40)
+blanket version        # Print the version
 ```
 
 Bind a keyboard shortcut (e.g., `Ctrl+Alt+B`) to `blanket toggle` in **Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts**.
@@ -104,8 +106,24 @@ This carries values (unlike signals), cannot lose commands, and lets
 - `blanket off` will **not** blank the screen unless the watcher answers on the
   socket, unless you pass `--force`. Blanking with no watcher is the one state
   from which there is no way back.
-- If the watcher cannot grab any input device — no wake-capable devices discovered, no `input` group membership, or every grab held by another process — it refuses to blank at all, and the display stays on. Blanking with no way to wake it is the one state from which there is no recovery.
+- If the watcher cannot grab any input device — no wake-capable devices
+  discovered, no `input` group membership, or every grab held by another
+  process — it refuses to blank at all, and the display stays on.
+- **Held keys are respected.** `blanket off` is usually fired by a keyboard
+  shortcut, so its keys are still down. The watcher waits (up to 1.5 s) for
+  them to be physically released *before* grabbing the keyboard. Grabbing
+  mid-press would hide the key-up events from the compositor, leaving
+  modifiers "stuck" (shortcuts stop working) and key-repeat re-firing the
+  shortcut — which shows up as the screen flickering on and off.
+- **The whole wake gesture is swallowed.** The key that wakes the screen is
+  kept grabbed until it is released (max 1.5 s), so applications never see
+  half a keystroke.
+- `blanket on` is idempotent: if the screen is already on it does nothing,
+  and it verifies the panel really came back (forcing it if not).
+- If the watcher shuts down or starts up while the screen is blank, it
   turns the display back on.
+- The control socket is private (mode 0600) and the watcher rejects peers
+  that are not the same user.
 - If the watcher starts up (e.g. after a crash or `systemctl --user restart`)
   while the screen is blank, it restores the display on startup.
 - `arm`/`disarm`/`on`/`off` are all idempotent; running any of them twice is
@@ -150,6 +168,23 @@ If you are in a session that doesn't expose Mutter's `DisplayConfig`
 (e.g. a nested compositor or a different desktop), `blanket doctor` will report
 that the D-Bus interface is unreachable.
 
+### After upgrading, `blanket off` says the watcher is not running
+
+An older watcher is probably still running and does not speak the new socket
+protocol. `./install.sh` now restarts the service for you; to do it by hand:
+
+```bash
+systemctl --user restart blanket-watcher
+blanket doctor
+```
+
+### The screen flickers or wakes instantly
+
+Run `blanket logs 20`. Every wake logs what caused it, e.g.
+`woke display (Some Touchpad: EV_ABS code=53 value=...)`. A device that wakes
+the screen on its own (a noisy touchpad, a mouse with a jittery sensor) will
+show up there — please include that line when reporting a problem.
+
 ### Watcher fails to grab a device
 
 Another process (like `evtest` or another grab tool) may be holding the device.
@@ -160,6 +195,17 @@ The watcher will log a warning and continue with the remaining devices.
 That's intentional: while an application inhibits idle, the idle timer is
 skipped. Run `blanket status -v` to see whether `idle inhibited: yes` is
 reported and by what. Set `respect_inhibitors=0` in the config to override.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v   # unit + end-to-end tests
+shellcheck blanket.sh install.sh uninstall.sh
+```
+
+The end-to-end tests (`tests/test_integration.py`) run the real CLI against
+the real watcher with a fake `busctl` and a fake input device, so they need no
+GNOME session and no `/dev/input` access.
 
 ## Uninstall
 

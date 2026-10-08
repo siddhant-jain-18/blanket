@@ -10,6 +10,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import redirect_stdout
@@ -322,9 +323,6 @@ class WakeFilterTests(unittest.TestCase):
         )
         state.start()
         self.addCleanup(state.stop)
-        poke = mock.patch.object(mod, "poke_session_activity")
-        self.poke = poke.start()
-        self.addCleanup(poke.stop)
 
     def _feed(self, *events):
         dev = mock.MagicMock()
@@ -446,8 +444,6 @@ class ImmediateWakeTests(unittest.TestCase):
             mod, "set_display_power"
         ) as power, mock.patch.object(
             mod, "display_power_state", return_value=mod.POWER_ON
-        ), mock.patch.object(
-            mod, "poke_session_activity"
         ), redirect_stdout(io.StringIO()):
             watcher._handle_input("/dev/input/event0")
         self.assertFalse(watcher.armed)
@@ -521,8 +517,6 @@ class WakePathTests(unittest.TestCase):
             side_effect=lambda m: order.append(f"power{m}") or True,
         ), mock.patch.object(
             mod, "display_power_state", return_value=mod.POWER_ON
-        ), mock.patch.object(
-            mod, "poke_session_activity"
         ), redirect_stdout(io.StringIO()):
             watcher._wake()
         self.assertLess(order.index("power0"), order.index("ungrab"), order)
@@ -536,24 +530,9 @@ class WakePathTests(unittest.TestCase):
             mod, "set_display_power", return_value=True
         ) as power, mock.patch.object(
             mod, "display_power_state", return_value=mod.POWER_ON
-        ), mock.patch.object(
-            mod, "poke_session_activity"
         ), redirect_stdout(io.StringIO()):
             watcher._wake()
         power.assert_called_once_with(mod.POWER_ON)
-
-    def test_wake_pokes_session_activity(self):
-        watcher = make_watcher()
-        watcher.armed = True
-        with mock.patch.object(
-            mod, "set_display_power", return_value=True
-        ), mock.patch.object(
-            mod, "display_power_state", return_value=mod.POWER_ON
-        ), mock.patch.object(
-            mod, "poke_session_activity"
-        ) as poke, redirect_stdout(io.StringIO()):
-            watcher._wake()
-        poke.assert_called_once_with()
 
     def test_wake_resets_idle_clock(self):
         # Regression: `blanket on` used to leave _last_activity untouched,
@@ -565,8 +544,6 @@ class WakePathTests(unittest.TestCase):
             mod, "set_display_power", return_value=True
         ), mock.patch.object(
             mod, "display_power_state", return_value=mod.POWER_ON
-        ), mock.patch.object(
-            mod, "poke_session_activity"
         ), redirect_stdout(io.StringIO()):
             watcher._wake()
         self.assertLess(watcher.idle_time(), 1.0)
@@ -584,8 +561,6 @@ class WakePathTests(unittest.TestCase):
             mod, "set_display_power", return_value=True
         ), mock.patch.object(
             mod, "display_power_state", return_value=mod.POWER_OFF
-        ), mock.patch.object(
-            mod, "poke_session_activity"
         ), mock.patch.object(
             mod.time, "sleep"
         ), redirect_stdout(io.StringIO()):
@@ -664,6 +639,181 @@ class CrashRecoveryTests(unittest.TestCase):
         rc, power = self._run_main(mod.POWER_ON)
         self.assertEqual(rc, 0)
         power.assert_not_called()
+
+
+class HeldKeyTests(unittest.TestCase):
+    """The shortcut that blanks the screen must finish before we grab."""
+
+    def _dev(self, pressed_sequence):
+        dev = mock.MagicMock()
+        dev.path = "/dev/input/event0"
+        dev.name = "kbd"
+        dev.read_one.return_value = None
+        dev.active_keys.side_effect = list(pressed_sequence) + [[]] * 50
+        return dev
+
+    def test_pressed_keys_is_robust(self):
+        self.assertEqual(mod._pressed_keys(mock.MagicMock()), [])  # not a list
+        bad = mock.MagicMock()
+        bad.active_keys.side_effect = OSError(19, "gone")
+        self.assertEqual(mod._pressed_keys(bad), [])
+        ok = mock.MagicMock()
+        ok.active_keys.return_value = [30]
+        self.assertEqual(mod._pressed_keys(ok), [30])
+
+    def test_wait_for_release_returns_once_keys_are_up(self):
+        w = make_watcher()
+        w.devices["d"] = self._dev([[48], [48], []])
+        with mock.patch.object(mod.time, "sleep"):
+            self.assertTrue(w._wait_for_release(timeout=5))
+
+    def test_wait_for_release_is_bounded(self):
+        w = make_watcher()
+        dev = mock.MagicMock()
+        dev.active_keys.return_value = [48]
+        w.devices["d"] = dev
+        with mock.patch.object(mod.sys, "stderr", io.StringIO()):
+            self.assertFalse(w._wait_for_release(timeout=0.05))
+
+    def test_blank_waits_for_release_before_grabbing(self):
+        w = make_watcher()
+        order = []
+        w._wait_for_release = mock.MagicMock(
+            side_effect=lambda *a, **k: order.append("wait") or True
+        )
+        w._grab_all = mock.MagicMock(
+            side_effect=lambda: order.append("grab") or 1
+        )
+        w._drain_all = mock.MagicMock()
+        with mock.patch.object(
+            mod, "set_display_power",
+            side_effect=lambda m: order.append(f"power{m}") or True,
+        ), mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_OFF
+        ), redirect_stdout(io.StringIO()):
+            self.assertTrue(w.blank())
+        self.assertEqual(order[:3], ["wait", "grab", "power3"], order)
+
+    def test_wake_keeps_swallowing_while_gesture_is_held(self):
+        w = make_watcher()
+        w.armed = True
+        dev = self._dev([[30]] * 5)
+        w.devices["d"] = dev
+        w.grabbed.add("d")
+        with mock.patch.object(
+            mod, "set_display_power", return_value=True
+        ), mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), redirect_stdout(io.StringIO()):
+            w._wake("test")
+        self.assertFalse(w.armed)
+        self.assertTrue(w._releasing)
+        dev.ungrab.assert_not_called()  # still swallowing the held key
+
+    def test_release_tick_hands_back_when_keys_are_up(self):
+        w = make_watcher()
+        dev = self._dev([[30], []])
+        w.devices["d"] = dev
+        w.grabbed.add("d")
+        w._releasing = True
+        w._release_deadline = time.monotonic() + 60
+        with redirect_stdout(io.StringIO()):
+            w._tick_release()          # key still down: keep grab
+            self.assertTrue(w._releasing)
+            w._tick_release()          # released: ungrab
+        self.assertFalse(w._releasing)
+        self.assertEqual(w.grabbed, set())
+        dev.ungrab.assert_called_once()
+
+    def test_release_tick_gives_up_at_deadline(self):
+        w = make_watcher()
+        dev = mock.MagicMock()
+        dev.active_keys.return_value = [30]  # stuck forever
+        w.devices["d"] = dev
+        w.grabbed.add("d")
+        w._releasing = True
+        w._release_deadline = time.monotonic() - 1
+        with redirect_stdout(io.StringIO()):
+            w._tick_release()
+        self.assertFalse(w._releasing)
+        dev.ungrab.assert_called_once()
+
+    def test_wake_without_held_keys_ungrabs_immediately(self):
+        w = make_watcher()
+        w.armed = True
+        dev = self._dev([])
+        w.devices["d"] = dev
+        w.grabbed.add("d")
+        with mock.patch.object(
+            mod, "set_display_power", return_value=True
+        ), mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), redirect_stdout(io.StringIO()):
+            w._wake("test")
+        self.assertFalse(w._releasing)
+        dev.ungrab.assert_called_once()
+
+
+class UnblankTests(unittest.TestCase):
+    def test_unblank_is_a_noop_when_already_on(self):
+        w = make_watcher()
+        with mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), mock.patch.object(mod, "set_display_power") as power:
+            w.unblank()
+        power.assert_not_called()  # no pointless visible modeset
+
+    def test_unblank_wakes_when_armed(self):
+        w = make_watcher()
+        w.armed = True
+        with mock.patch.object(
+            mod, "display_power_state", return_value=mod.POWER_ON
+        ), mock.patch.object(
+            mod, "set_display_power", return_value=True
+        ) as power, redirect_stdout(io.StringIO()):
+            w.unblank()
+        power.assert_called_once_with(mod.POWER_ON)
+
+    def test_unblank_fails_awake_when_state_unknown(self):
+        w = make_watcher()
+        with mock.patch.object(
+            mod, "display_power_state", return_value=None
+        ), mock.patch.object(
+            mod, "set_display_power", return_value=True
+        ) as power, redirect_stdout(io.StringIO()):
+            w.unblank()
+        power.assert_called_once_with(mod.POWER_ON)
+
+    def test_no_session_poke_is_left_behind(self):
+        # Regression: SetActive(false) on org.gnome.ScreenSaver made the
+        # shell redraw its lock curtain on every wake (visible flicker).
+        self.assertFalse(hasattr(mod, "poke_session_activity"))
+
+
+class SocketHardeningTests(unittest.TestCase):
+    def test_peer_check_accepts_own_uid(self):
+        a, b = __import__("socket").socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        self.assertTrue(mod.Watcher._peer_is_me(a))
+
+    def test_peer_check_rejects_other_uid(self):
+        conn = mock.MagicMock()
+        import struct as _struct
+        conn.getsockopt.return_value = _struct.pack(
+            "3i", 1, os.getuid() + 1, 0
+        )
+        self.assertFalse(mod.Watcher._peer_is_me(conn))
+
+    def test_stale_clients_are_reaped(self):
+        w = make_watcher()
+        conn = mock.MagicMock()
+        w.clients[99] = (conn, bytearray())
+        w.client_born[99] = time.monotonic() - mod.CLIENT_TIMEOUT - 1
+        w.poller = mock.MagicMock()
+        w._reap_stale_clients()
+        self.assertNotIn(99, w.clients)
+        conn.close.assert_called_once()
 
 
 if __name__ == "__main__":

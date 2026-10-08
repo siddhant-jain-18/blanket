@@ -34,7 +34,7 @@ python3 -c 'import evdev' 2>/dev/null \
 
 if [[ -f "$HERE/tests/test_watcher.py" ]]; then
     say "Running unit tests..."
-    if python3 -m unittest discover -s "$HERE/tests" -q >/dev/null 2>&1; then
+    if python3 -m unittest discover -s "$HERE/tests" -p 'test_watcher.py' -q >/dev/null 2>&1; then
         say "  [ok]   unit tests pass"
     else
         warn "  [warn] unit tests failed — rerun with:"
@@ -82,11 +82,20 @@ fi
 
 # --- enable the service ----------------------------------------------------
 
+# Make sure the screen is on before we replace the watcher: an old watcher
+# that is killed while the panel is blank would strand the display.
+busctl --user set-property org.gnome.Mutter.DisplayConfig \
+    /org/gnome/Mutter/DisplayConfig org.gnome.Mutter.DisplayConfig \
+    PowerSaveMode i 0 >/dev/null 2>&1 || true
+
 systemctl --user daemon-reload
 # Clear any prior failed state so a stale "restart counter" from earlier
 # experiments does not trigger immediate rate-limiting on the fresh start.
 systemctl --user reset-failed "$SERVICE" 2>/dev/null || true
-systemctl --user enable --now "$SERVICE"
+systemctl --user enable "$SERVICE"
+# `enable --now` would leave an already-running OLD watcher in place after
+# an upgrade (the new CLI then cannot talk to it).  Always restart.
+systemctl --user restart "$SERVICE"
 
 # Give it a moment to come up, and make sure it *stayed* up — a crash on
 # start would otherwise be reported as a success (the 0.5s check used to

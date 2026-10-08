@@ -25,6 +25,11 @@ jobs:
           /usr/bin/python3 --version
           which python3 || true
 
+      - name: ShellCheck
+        run: |
+          sudo apt-get install -y -q shellcheck
+          shellcheck -S warning blanket.sh install.sh uninstall.sh
+
       - name: Compile check (watcher + completions sanity)
         run: |
           /usr/bin/python3 -m py_compile blanket-watcher.py

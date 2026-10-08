@@ -8,6 +8,11 @@ for arg in "$@"; do
     [[ "$arg" == "--purge" ]] && PURGE=1
 done
 
+# Never leave the panel blank when the thing that wakes it goes away.
+busctl --user set-property org.gnome.Mutter.DisplayConfig \
+    /org/gnome/Mutter/DisplayConfig org.gnome.Mutter.DisplayConfig \
+    PowerSaveMode i 0 >/dev/null 2>&1 || true
+
 echo "Stopping and disabling $SERVICE..."
 systemctl --user disable --now "$SERVICE" 2>/dev/null || true
 

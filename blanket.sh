@@ -10,12 +10,16 @@
 #   blanket idle [N|off]    Blank after N seconds of inactivity.
 #   blanket list            List the input devices the watcher has detected.
 #   blanket doctor          Diagnose common setup problems.
+#   blanket logs [N]        Show the last N lines of the watcher log.
+#   blanket version         Print the version.
 #
 set -euo pipefail
 
 BUS="org.gnome.Mutter.DisplayConfig"
 OBJ="/org/gnome/Mutter/DisplayConfig"
 IFACE="org.gnome.Mutter.DisplayConfig"
+
+VERSION="2.1.0"
 
 POWER_ON=0
 POWER_OFF=3
@@ -44,7 +48,7 @@ path, *args = sys.argv[1:]
 message = (" ".join(args) + "\n").encode()
 try:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(5.0)
+    sock.settimeout(10.0)   # blank may wait for held keys
     sock.connect(path)
     sock.sendall(message)
     buf = b""
@@ -151,6 +155,8 @@ Usage:
   blanket idle [N|off]    Blank after N seconds of inactivity (default: show).
   blanket list            List the input devices the watcher has detected.
   blanket doctor          Diagnose common setup problems.
+  blanket logs [N]        Show the last N (default 40) watcher log lines.
+  blanket version         Print the version.
 
 Any keyboard or touchpad input wakes the display. Requires the
 blanket-watcher user service (run ./install.sh).
@@ -167,6 +173,8 @@ cmd_off() {
 
     if ! _watcher_alive; then
         if [[ $force -eq 1 ]]; then
+            echo "blanket: warning: no watcher is running; run 'blanket on' from another" >&2
+            echo "         machine or TTY to bring the screen back." >&2
             _set_mode "$POWER_OFF"
             return 0
         fi
@@ -205,6 +213,11 @@ cmd_on() {
     local out
     out="$(_ctl unblank || true)"
     if [[ "$out" != ok=true* ]]; then
+        _set_mode "$POWER_ON"
+        return 0
+    fi
+    # Trust but verify: if the panel still is not on, force it.
+    if [[ "$(_get_mode)" != "$POWER_ON" ]]; then
         _set_mode "$POWER_ON"
     fi
 }
@@ -390,6 +403,11 @@ cmd_doctor() {
         echo "  [FAIL] blanket-watcher is not running"
         echo "         -> systemctl --user restart blanket-watcher"
         echo "         -> journalctl --user -u blanket-watcher -e"
+        if command -v pgrep >/dev/null 2>&1 && pgrep -u "$(id -u)" -f blanket-watcher >/dev/null 2>&1; then
+            echo "         (a watcher process exists but does not answer on the control"
+            echo "          socket: it is probably an OLD version still running after an"
+            echo "          upgrade -> systemctl --user restart blanket-watcher)"
+        fi
         problems=$(( problems + 1 ))
     fi
 
@@ -402,6 +420,14 @@ cmd_doctor() {
     return 1
 }
 
+cmd_logs() {
+    local n="${1:-40}"
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "blanket: logs expects a number of lines" >&2; return 1; }
+    command -v journalctl >/dev/null 2>&1 \
+        || { echo "blanket: journalctl not found" >&2; return 1; }
+    journalctl --user -u blanket-watcher -n "$n" --no-pager
+}
+
 # --- entry -----------------------------------------------------------------
 
 case "${1:-}" in
@@ -412,6 +438,8 @@ case "${1:-}" in
     idle)   shift; cmd_idle "$@" ;;
     list)   cmd_list ;;
     doctor) cmd_doctor ;;
+    logs)   shift; cmd_logs "$@" ;;
+    version|-V|--version) echo "blanket $VERSION" ;;
     -h|--help|help) usage ;;
     "") usage >&2; exit 1 ;;
     *)  echo "blanket: unknown command: $1" >&2; usage >&2; exit 1 ;;

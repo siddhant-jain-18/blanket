@@ -7,6 +7,9 @@ Type=simple
 ExecStart=%h/.local/bin/blanket-watcher
 Restart=on-failure
 RestartSec=2
+# The watcher restores the display on SIGTERM; give it time to do so.
+TimeoutStopSec=5
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target
